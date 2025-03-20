@@ -17,6 +17,319 @@
 from __future__ import annotations
 import collections
 from math import sqrt
+import scipy.stats
+import torch
+from torch import Tensor
+from transformers import LogitsProcessor
+import nltk
+import ssl
+from nltk.util import ngrams
+from normalizers import normalization_strategy_lookup
+
+###############################################
+# Revised Watermark Classes
+###############################################
+
+class WatermarkBase_kgw:
+    def __init__(
+            self,
+            vocab: list[int] = None,
+            gamma: float = 0.5,
+            delta: float = 2.0,
+            seeding_scheme: str = "simple_1",
+            hash_key: int = 15485863,
+            select_green_tokens: bool = True,
+            precomputed_pairing: list[tuple[int, int]] = None,
+            unique_tokens: list[int] = None,
+    ):
+        self.vocab = vocab  # list of token IDs (usually 0,...,n-1)
+        self.vocab_size = len(vocab)
+        self.gamma = gamma  # fraction of tokens to designate as green (target size)
+        self.delta = delta  # bias to add to green tokens' logits
+        self.seeding_scheme = seeding_scheme
+        self.rng = None
+        self.hash_key = hash_key
+        self.select_green_tokens = select_green_tokens
+        self.pairing = precomputed_pairing  # perfect matching on tokens with synonyms (indices in vocab)
+        self.unique_tokens = unique_tokens  # list of token IDs that have no synonyms
+
+    def _seed_rng(self, input_ids: torch.LongTensor, seeding_scheme: str = None) -> None:
+        """
+        Seeds the RNG deterministically using the last token in input_ids.
+        For the "simple_1" scheme, seed = hash_key * (last token id).
+        """
+        if seeding_scheme is None:
+            seeding_scheme = self.seeding_scheme
+        # Ensure the RNG is initialized.
+        if self.rng is None:
+            self.rng = torch.Generator(device=input_ids.device)
+        if seeding_scheme == "simple_1":
+            assert input_ids.shape[-1] >= 1, "Input must have at least one token."
+            prev_token = input_ids[-1].item()
+            self.rng.manual_seed(self.hash_key * prev_token)
+        else:
+            raise NotImplementedError(f"Seeding scheme {seeding_scheme} not implemented.")
+        return
+
+    def _get_greenlist_ids(self, input_ids: torch.LongTensor) -> list[int]:
+        """
+        Returns a list of token IDs that form the green list.
+        If a precomputed pairing exists, then:
+          - All tokens from the unique set (those with no synonyms) are automatically in the green list.
+          - For each pair in the perfect matching (on tokens with synonyms), a fair coin flip (using the seeded RNG)
+            selects one token from the pair.
+        Otherwise, falls back to a random permutation method.
+        Optionally, the list may be truncated to a target size (gamma * vocab_size).
+        """
+        self._seed_rng(input_ids)
+        if self.pairing is None or self.unique_tokens is None:
+            # Fallback: use random permutation.
+            greenlist_size = int(self.vocab_size * self.gamma)
+            vocab_permutation = torch.randperm(self.vocab_size, device=input_ids.device, generator=self.rng)
+            if self.select_green_tokens:
+                return vocab_permutation[:greenlist_size].tolist()
+            else:
+                return vocab_permutation[-greenlist_size:].tolist()
+        else:
+            # Start with all unique tokens.
+            greenlist_ids = self.unique_tokens.copy()
+            # For tokens that have synonyms (precomputed pairing), randomly assign one from each pair.
+            for pair in self.pairing:
+                coin_flip = (torch.rand(1, generator=self.rng) < 0.5).item()
+                chosen = pair[0] if coin_flip == 1 else pair[1]
+                greenlist_ids.append(chosen)
+            # Optionally, enforce a maximum size (gamma * vocab_size)
+            desired_size = int(self.vocab_size * self.gamma)
+            if len(greenlist_ids) > desired_size:
+                indices = torch.randperm(len(greenlist_ids), generator=self.rng)[:desired_size].tolist()
+                greenlist_ids = [greenlist_ids[i] for i in indices]
+            return greenlist_ids
+
+
+class WatermarkLogitsProcessor_kgw(WatermarkBase_kgw, LogitsProcessor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _calc_greenlist_mask(self, scores: torch.FloatTensor, greenlist_token_ids) -> torch.BoolTensor:
+        green_tokens_mask = torch.zeros_like(scores)
+        for b_idx in range(len(greenlist_token_ids)):
+            green_tokens_mask[b_idx][greenlist_token_ids[b_idx]] = 1
+        return green_tokens_mask.bool()
+
+    def _bias_greenlist_logits(self, scores: torch.Tensor, greenlist_mask: torch.Tensor,
+                               greenlist_bias: float) -> torch.Tensor:
+        scores[greenlist_mask] = scores[greenlist_mask] + greenlist_bias
+        return scores
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if self.rng is None:
+            self.rng = torch.Generator(device=input_ids.device)
+        batched_greenlist_ids = [None for _ in range(input_ids.shape[0])]
+        for b_idx in range(input_ids.shape[0]):
+            greenlist_ids = self._get_greenlist_ids(input_ids[b_idx])
+            batched_greenlist_ids[b_idx] = greenlist_ids
+        green_tokens_mask = self._calc_greenlist_mask(scores, batched_greenlist_ids)
+        scores = self._bias_greenlist_logits(scores, green_tokens_mask, self.delta)
+        return scores
+
+
+class WatermarkDetector_kgw(WatermarkBase_kgw):
+    def __init__(
+            self,
+            *args,
+            device: torch.device = None,
+            tokenizer: Tokenizer = None,
+            z_threshold: float = 4.0,
+            normalizers: list[str] = ["unicode"],
+            ignore_repeated_bigrams: bool = True,
+            **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        assert device, "Device must be provided."
+        assert tokenizer, "A tokenizer is required for detection."
+        self.tokenizer = tokenizer
+        self.device = device
+        self.z_threshold = z_threshold
+        self.rng = torch.Generator(device=self.device)
+        if self.seeding_scheme == "simple_1":
+            self.min_prefix_len = 1
+        else:
+            raise NotImplementedError(f"Seeding scheme {self.seeding_scheme} not implemented.")
+        self.normalizers = [normalization_strategy_lookup(norm) for norm in normalizers]
+        self.ignore_repeated_bigrams = ignore_repeated_bigrams
+        if self.ignore_repeated_bigrams:
+            assert self.seeding_scheme == "simple_1", "Repeated bigram variant requires simple_1 seeding."
+
+    def _compute_z_score(self, observed_count, T):
+        expected_count = self.gamma
+        numer = observed_count - expected_count * T
+        denom = sqrt(T * expected_count * (1 - expected_count))
+        return numer / denom
+
+    def _compute_p_value(self, z):
+        return scipy.stats.norm.sf(z)
+
+    def _score_sequence(
+            self,
+            input_ids: Tensor,
+            return_num_tokens_scored: bool = True,
+            return_num_green_tokens: bool = True,
+            return_green_fraction: bool = True,
+            return_green_token_mask: bool = False,
+            return_z_score: bool = True,
+            return_p_value: bool = True,
+    ):
+        if self.ignore_repeated_bigrams:
+            bigram_table = {}
+            token_bigram_generator = ngrams(input_ids.cpu().tolist(), 2)
+            freq = collections.Counter(token_bigram_generator)
+            num_tokens_scored = len(freq.keys())
+            for bigram in freq.keys():
+                prefix = torch.tensor([bigram[0]], device=self.device)
+                greenlist_ids = self._get_greenlist_ids(prefix)
+                bigram_table[bigram] = True if bigram[1] in greenlist_ids else False
+            green_token_count = sum(bigram_table.values())
+        else:
+            num_tokens_scored = len(input_ids) - self.min_prefix_len
+            if num_tokens_scored < 1:
+                raise ValueError("Not enough tokens to score.")
+            green_token_count = 0
+            green_token_mask = []
+            for idx in range(self.min_prefix_len, len(input_ids)):
+                curr_token = input_ids[idx]
+                greenlist_ids = self._get_greenlist_ids(input_ids[:idx])
+                if curr_token in greenlist_ids:
+                    green_token_count += 1
+                    green_token_mask.append(True)
+                else:
+                    green_token_mask.append(False)
+        score_dict = {}
+        if return_num_tokens_scored:
+            score_dict["num_tokens_scored"] = num_tokens_scored
+        if return_num_green_tokens:
+            score_dict["num_green_tokens"] = green_token_count
+        if return_green_fraction:
+            score_dict["green_fraction"] = green_token_count / num_tokens_scored
+        if return_z_score:
+            score_dict["z_score"] = self._compute_z_score(green_token_count, num_tokens_scored)
+        if return_p_value:
+            z = score_dict.get("z_score", self._compute_z_score(green_token_count, num_tokens_scored))
+            score_dict["p_value"] = self._compute_p_value(z)
+        if return_green_token_mask:
+            score_dict["green_token_mask"] = green_token_mask
+        return score_dict
+
+    def detect(
+            self,
+            text: str = None,
+            tokenized_text: list[int] = None,
+            return_prediction: bool = True,
+            return_scores: bool = True,
+            z_threshold: float = None,
+            **kwargs,
+    ) -> dict:
+        assert (text is not None) ^ (tokenized_text is not None), "Provide either raw or tokenized text."
+        if return_prediction:
+            kwargs["return_p_value"] = True
+        for normalizer in self.normalizers:
+            text = normalizer(text)
+        if tokenized_text is None:
+            tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].to(
+                self.device)
+            if tokenized_text[0] == self.tokenizer.bos_token_id:
+                tokenized_text = tokenized_text[1:]
+        else:
+            if self.tokenizer is not None and tokenized_text[0] == self.tokenizer.bos_token_id:
+                tokenized_text = tokenized_text[1:]
+        output_dict = {}
+        score_dict = self._score_sequence(tokenized_text, **kwargs)
+        if return_scores:
+            output_dict.update(score_dict)
+        if return_prediction:
+            z_threshold = z_threshold if z_threshold is not None else self.z_threshold
+            output_dict["prediction"] = score_dict["z_score"] > z_threshold
+            if output_dict["prediction"]:
+                output_dict["confidence"] = 1 - score_dict["p_value"]
+        return output_dict
+
+'''
+###############################################
+# Outline of the New Partitioning Method
+###############################################
+# 1. Obtain the vocabulary from the model's tokenizer using get_vocabulary(tokenizer).
+# 2. Use filter_tokens_with_synonyms(vocab_list) to split the vocabulary indices into:
+#       - unique_indices: tokens with no synonyms (set A)
+#       - paired_indices: tokens with at least one synonym (set B)
+# 3. Construct the similarity matrix for tokens in set B using construct_similarity_matrix.
+# 4. Compute a perfect matching on set B using find_perfect_matching.
+# 5. In _get_greenlist_ids, use the precomputed pairing (mapped back to original token IDs)
+#    and return all tokens from set A plus one token per pair (chosen at random by a coin flip).
+###############################################
+# Full Code Example for the Revised Watermark Partition
+###############################################
+
+if __name__ == "__main__":
+    # For testing purposes, use a small model like 'distilgpt2' which can run on CPU.
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("facebook/opt-1.3b")
+    vocab_list = get_vocabulary(tokenizer)
+    print(f"Vocabulary size: {len(vocab_list)}")
+
+    # Filter tokens: separate those with no synonyms (set A) and with synonyms (set B)
+    unique_indices, paired_indices = filter_tokens_with_synonyms(vocab_list)
+    print(f"Number of unique tokens (no synonyms, set A): {len(unique_indices)}")
+    print(f"Number of tokens with synonyms (set B): {len(paired_indices)}")
+
+    # Construct similarity matrix for tokens in set B.
+    similarity_matrix = construct_similarity_matrix(vocab_list, paired_indices)
+    # Find a perfect matching on the tokens in set B.
+    matching = find_perfect_matching(similarity_matrix)
+    # Map matching indices (relative to paired_indices) back to the original vocabulary indices.
+    mapped_pairing = [(paired_indices[i], paired_indices[j]) for (i, j) in matching]
+    print("Computed perfect matching (pairs) on tokens with synonyms (set B):")
+    print(mapped_pairing)
+
+    # Initialize WatermarkLogitsProcessor with precomputed pairing and unique tokens.
+    wm_processor = WatermarkLogitsProcessor(
+        vocab=list(range(len(vocab_list))),
+        gamma=0.25,
+        delta=2.0,
+        seeding_scheme="simple_1",
+        select_green_tokens=True,
+        precomputed_pairing=mapped_pairing,
+        unique_tokens=unique_indices
+    )
+
+    # Test _get_greenlist_ids with a sample prompt.
+    sample_prompt = "This is a good day."
+    input_ids = torch.tensor(tokenizer.encode(sample_prompt))
+    greenlist_ids = wm_processor._get_greenlist_ids(input_ids)
+    print("Greenlist token IDs for the prompt:")
+    print(greenlist_ids)
+    green_tokens = [vocab_list[tok] for tok in greenlist_ids]
+    print("Greenlist tokens (strings):")
+    print(green_tokens)'''
+
+
+'''# coding=utf-8
+# Copyright 2023 Authors of "A Watermark for Large Language Models"
+# available at https://arxiv.org/abs/2301.10226
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+import collections
+from math import sqrt
 
 import scipy.stats
 
@@ -279,4 +592,4 @@ class WatermarkDetector(WatermarkBase):
             if output_dict["prediction"]:
                 output_dict["confidence"] = 1 - score_dict["p_value"]
 
-        return output_dict
+        return output_dict'''
