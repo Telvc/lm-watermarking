@@ -465,10 +465,12 @@ class WatermarkDetector(WatermarkBase):
 #############################
 
 def load_model(args):
-    args.is_seq2seq_model = any([(model_type in args.model_name_or_path) for model_type in ["t5", "T0"]])
-    args.is_decoder_only_model = any(
-        [(model_type in args.model_name_or_path) for model_type in ["gpt", "opt", "bloom"]])
+    # Set model type attributes on args.
+    args.is_seq2seq_model = any(model_type in args.model_name_or_path for model_type in ["t5", "T0"])
+    args.is_decoder_only_model = any(model_type in args.model_name_or_path for model_type in ["gpt", "opt", "bloom"])
+
     if args.is_seq2seq_model:
+        from transformers import AutoModelForSeq2SeqLM
         model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path)
     elif args.is_decoder_only_model:
         if args.load_fp16:
@@ -478,6 +480,7 @@ def load_model(args):
             model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
     else:
         raise ValueError(f"Unknown model type: {args.model_name_or_path}")
+
     if args.use_gpu:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if not args.load_fp16:
@@ -485,12 +488,15 @@ def load_model(args):
     else:
         device = "cpu"
     model.eval()
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     return model, tokenizer, device
 
-
 def generate(prompt, args, model=None, device=None, tokenizer=None):
     # print(f"Generating with {args}")
+    # Set model type attributes on args.
+    args.is_seq2seq_model = any(model_type in args.model_name_or_path for model_type in ["t5", "T0"])
+    args.is_decoder_only_model = any(model_type in args.model_name_or_path for model_type in ["gpt", "opt", "bloom"])
 
     # Instantiate the watermark processor with precomputed pairing/unique tokens.
     # Assume that in main() we precomputed these values (see below).
@@ -676,40 +682,150 @@ def compute_perplexity(model, tokenizer, text: str, device):
     perplexity = torch.exp(loss).item()
     return perplexity
 
+# === Cos similarity and greedy matching ===
 
-# === Main evaluation loop over 500 prompts ===
+import torch
+import torch.nn.functional as F
 
-def evaluate_watermarking(truncated_texts, model, tokenizer, args):
+def construct_similarity_matrix_cos(vocab_list: list[str], indices: list[int], embedding_matrix: torch.Tensor) -> torch.Tensor:
     """
-    For each prompt in truncated_texts:
-      - Generate watermarked and non-watermarked completions.
-      - Compute detection metrics: green token count (paired only), z–score, p–value, detection judgement.
-      - Compute perplexity.
-    Finally, among prompts where both outputs have length >=195 tokens, compute average perplexity
-    and AUC (using z–scores as continuous detection scores, with label 1 for watermarked and 0 for non-watermarked).
-    Returns a dictionary of aggregated metrics and a list of per-prompt results.
-    """
-    results = []  # store per-prompt metrics
-    watermarked_z = []  # list of z–scores for watermarked outputs
-    watermarked_z_kgw = []
-    nonwatermarked_z = []  # list of z–scores for non-watermarked outputs
-    nonwatermarked_z_kgw = []
-    true_labels = []  # ground-truth: 1 for watermarked, 0 for non-watermarked
-    true_labels_kgw = []
-    watermarked_perplexities = []
-    watermarked_perplexities_kgw = []
-    nonwatermarked_perplexities = []
-    nonwatermarked_perplexities_kgw = []
+    Constructs an m x m similarity matrix for tokens specified by indices,
+    using cosine similarity between token embeddings.
 
-    # Loop over each prompt in the list.
+    Args:
+      vocab_list: List of all tokens (strings).
+      indices: List of token indices corresponding to the non-unique tokens (set B).
+      embedding_matrix: A torch.Tensor of shape (vocab_size, hidden_dim) representing the token embeddings.
+
+    Returns:
+      A torch.Tensor of shape (m, m) where each entry [i][j] is the cosine similarity between
+      the embeddings of vocab_list[indices[i]] and vocab_list[indices[j]], with the diagonal entries set to 0.
+    """
+    # Extract embeddings for the selected tokens (non-unique tokens).
+    selected_embeddings = embedding_matrix[indices]  # shape: (m, hidden_dim)
+
+    # Normalize the embeddings along the feature dimension.
+    norm_embeddings = F.normalize(selected_embeddings, p=2, dim=1)
+
+    # Compute the cosine similarity matrix as the dot product between normalized embeddings.
+    sim_matrix = torch.mm(norm_embeddings, norm_embeddings.t())
+
+    # Set the diagonal entries to 0 (to ignore self-similarity).
+    sim_matrix.fill_diagonal_(0)
+
+    return sim_matrix
+
+import math
+import random
+
+def find_perfect_matching_greedy_random(similarity_matrix: list[list[float]]) -> list[tuple[int, int]]:
+    """
+    Constructs a greedy matching from the similarity matrix using random sampling.
+    In each iteration, a random token i is selected from the unmatched set.
+    Then, approximately ceil(log2(n)) tokens (where n is the current number of unmatched tokens)
+    are randomly sampled from the remaining tokens, and the token j with the highest similarity
+    (i.e. highest value in similarity_matrix[i][j]) is selected as a match.
+
+    The function returns a list of tuples (i, j) (with i < j) representing the matched token indices.
+    Note: The similarity matrix should have 0 on its diagonal.
+    """
+    m = len(similarity_matrix)
+    unmatched = list(range(m))
+    matching = []
+
+    pbar = tqdm(total=len(unmatched)//2, desc="Greedy random matching")
+    while len(unmatched) > 1:
+        n = len(unmatched)
+        # Set sample size to ceil(log2(n)); ensure at least one candidate.
+        sample_size = math.ceil(math.log(n, 2)) if n > 1 else 1
+        # Randomly choose one token i from the unmatched set.
+        i = random.choice(unmatched)
+        # Build a list of candidates (all unmatched tokens except i).
+        remaining = [x for x in unmatched if x != i]
+        # Adjust sample_size if there are fewer candidates than sample_size.
+        sample_size = min(sample_size, len(remaining))
+        # Randomly sample sample_size candidates.
+        candidates = random.sample(remaining, sample_size)
+        # Find the candidate j with maximum similarity with i.
+        best_j = candidates[0]
+        best_weight = similarity_matrix[i][best_j]
+        for j in candidates:
+            w = similarity_matrix[i][j]
+            if w > best_weight:
+                best_weight = w
+                best_j = j
+        # Add the pair (min(i, best_j), max(i, best_j)) for consistency.
+        matching.append((min(i, best_j), max(i, best_j)))
+        # Remove both tokens from the unmatched set.
+        unmatched.remove(i)
+        if best_j in unmatched:
+            unmatched.remove(best_j)
+        pbar.update(1)
+    pbar.close()
+    return matching
+
+
+import numpy as np
+from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
+
+
+# --- Helper: Check if both outputs meet length condition (≥195 tokens) ---
+def valid_length(wm_text, nw_text, tokenizer, min_tokens=195):
+    len_wm = len(tokenizer(wm_text)["input_ids"])
+    len_nw = len(tokenizer(nw_text)["input_ids"])
+    return (len_wm >= min_tokens) and (len_nw >= min_tokens)
+
+# ---- Main Evaluation Function ----
+
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import roc_curve, auc  # Instead of roc_auc_score
+
+def evaluate_watermarking(truncated_texts, model, tokenizer, args, args_cos=None):
+    """
+    For each prompt in truncated_texts, generate completions using three methods:
+      1. Default watermark method (our method)
+      2. KGW method (via generate_kgw and detect_kgw)
+      3. Cosine–similarity based method (via generate with args_cos and detect_cos)
+
+    For each method, compute:
+      - Number of tokens generated
+      - Detection metrics (only on paired tokens): green token count, tokens scored, green fraction,
+        z–score and p–value, judgement (watermarked vs. non-watermarked), perplexity.
+
+    Only prompts where all outputs (for all three methods) have length ≥195 tokens are considered.
+    We then compute aggregated metrics (average perplexity) and an ROC–AUC by computing
+    the false-positive and true-positive rates (via roc_curve) and passing them to auc().
+
+    Returns:
+      results: a list of per–prompt result dictionaries.
+      aggregated: a dictionary with aggregated metrics for each method.
+    """
+
+    results = []
+
+    # Accumulators for default method:
+    wm_z_default_acc, nw_z_default_acc, labels_default = [], [], []
+    ppl_wm_default_acc, ppl_nw_default_acc = [], []
+    green_counts_w_default_acc, tokens_scored_w_default_acc, props_w_default_acc = [], [], []
+
+    # For KGW method:
+    wm_z_kgw_acc, nw_z_kgw_acc, labels_kgw = [], [], []
+    ppl_wm_kgw_acc, ppl_nw_kgw_acc = [], []
+    green_counts_w_kgw_acc, tokens_scored_w_kgw_acc, props_w_kgw_acc = [], [], []
+
+    # For Cosine-based method:
+    wm_z_cos_acc, nw_z_cos_acc, labels_cos = [], [], []
+    ppl_wm_cos_acc, ppl_nw_cos_acc = [], []
+    green_counts_w_cos_acc, tokens_scored_w_cos_acc, props_w_cos_acc = [], [], []
+
     for prompt in tqdm(truncated_texts, desc="Evaluating prompts"):
-        # Generate outputs (this function returns: redecoded_input, truncation_warning, decoded_output_without_watermark, decoded_output_with_watermark, args)
-        redecoded_input, truncation_warning, decoded_output_without_watermark, decoded_output_with_watermark, _ = generate(
+        # --- Default Watermark Generation ---
+        redecoded_input, truncation_warning, decoded_nw, decoded_wm, _ = generate(
             prompt, args, model=model, device=device, tokenizer=tokenizer
         )
-
-        # Create a watermark processor instance (assume args already contains precomputed pairing and unique tokens)
-        wm_processor = WatermarkLogitsProcessor(
+        wm_processor_default = WatermarkLogitsProcessor(
             vocab=list(tokenizer.get_vocab().values()),
             gamma=args.gamma,
             delta=args.delta,
@@ -719,128 +835,251 @@ def evaluate_watermarking(truncated_texts, model, tokenizer, args):
             unique_tokens=args.unique_tokens
         )
 
-        # --- kgw mark ---
-        _, _, decoded_output_without_watermark_kgw, decoded_output_with_watermark_kgw, _ = generate_kgw(prompt,
-                                                                                                args,
-                                                                                                model=model,
-                                                                                                device=device,
-                                                                                                tokenizer=tokenizer)
-        without_watermark_detection_result_kgw = detect_kgw(decoded_output_without_watermark_kgw,
-                                                        args,
-                                                        device=device,
-                                                        tokenizer=tokenizer)
-        with_watermark_detection_result_kgw = detect_kgw(decoded_output_with_watermark_kgw,
-                                                     args,
-                                                     device=device,
-                                                     tokenizer=tokenizer)
+        # Count green tokens (only among paired tokens) for watermarked text:
+        green_count_w, tokens_scored_w, prop_w = count_green_tokens_paired(
+            tokenizer, wm_processor_default, decoded_wm
+        )
+        z_default, p_default = compute_p_value(green_count_w, tokens_scored_w)
 
-        # Compute perplexity for both watermarked and non-watermarked outputs:
-        ppl_nw_kgw = compute_perplexity(model, tokenizer, decoded_output_without_watermark_kgw, device)
-        ppl_wm_kgw = compute_perplexity(model, tokenizer, decoded_output_with_watermark_kgw, device)
-        green_count_kgw = with_watermark_detection_result_kgw[1]['num_green_tokens']
-        tokens_scored_kgw = with_watermark_detection_result_kgw[1]['num_tokens_scored']
-        prop_kgw = with_watermark_detection_result_kgw[1]['green_fraction']
-        z_kgw = with_watermark_detection_result_kgw[1]['z_score']
-        z_nw_kgw = without_watermark_detection_result_kgw[1]['z_score']
-        p_kgw = with_watermark_detection_result_kgw[1]['p_value']
-        judgement_kgw = "LLM-generated (watermarked)" if z_kgw > args.detection_z_threshold else "Human-generated (non-watermarked)"
+        # Non-watermarked text:
+        green_count_nw, tokens_scored_nw, prop_nw = count_green_tokens_paired(
+            tokenizer, wm_processor_default, decoded_nw
+        )
+        z_nw_default, p_nw_default = compute_p_value(green_count_nw, tokens_scored_nw)
 
-        # --- our method ---
-        # Compute detection metrics for watermarked text (only paired tokens are counted).
-        green_count_w, tokens_scored_w, prop_w = count_green_tokens_paired(tokenizer, wm_processor,
-                                                                           decoded_output_with_watermark)
-        z_w, p_w = compute_p_value(green_count_w, tokens_scored_w)
-        judgement_w = "LLM-generated (watermarked)" if z_w > args.detection_z_threshold else "Human-generated (non-watermarked)"
+        judgement_default = (
+            "LLM-generated (watermarked)" if z_default > args.detection_z_threshold else "Human-generated (non-watermarked)"
+        )
+        perplexity_wm = compute_perplexity(model, tokenizer, decoded_wm, device)
+        perplexity_nw = compute_perplexity(model, tokenizer, decoded_nw, device)
+        tokens_generated_default = len(tokenizer(decoded_wm)["input_ids"])
 
-        # Compute detection metrics for non-watermarked text.
-        green_count_nw, tokens_scored_nw, prop_nw = count_green_tokens_paired(tokenizer, wm_processor,
-                                                                              decoded_output_without_watermark)
-        z_nw, p_nw = compute_p_value(green_count_nw, tokens_scored_nw)
-        judgement_nw = "LLM-generated (watermarked)" if z_nw > args.detection_z_threshold else "Human-generated (non-watermarked)"
+        # --- KGW Method ---
+        redecoded_input_kgw, truncation_warning_kgw, decoded_nw_kgw, decoded_wm_kgw, _ = generate_kgw(
+            prompt, args, model=model, device=device, tokenizer=tokenizer
+        )
+        detect_result_w_kgw = detect_kgw(decoded_wm_kgw, args, device=device, tokenizer=tokenizer)[1]
+        if detect_result_w_kgw.score_dict == None:
+            continue
+        z_kgw = detect_result_w_kgw["z_score"]
+        green_count_w_kgw = detect_result_w_kgw["num_green_tokens"]
+        tokens_scored_w_kgw_local = detect_result_w_kgw["num_tokens_scored"]
+        prop_w_kgw = detect_result_w_kgw["green_fraction"]
 
-        # Compute perplexity for both outputs.
-        ppl_wm = compute_perplexity(model, tokenizer, decoded_output_with_watermark, device)
-        ppl_nw = compute_perplexity(model, tokenizer, decoded_output_without_watermark, device)
+        detect_result_nw_kgw = detect_kgw(decoded_nw_kgw, args, device=device, tokenizer=tokenizer)[1]
+        if detect_result_nw_kgw.score_dict == None:
+            continue
+        z_nw_kgw = detect_result_nw_kgw["z_score"]
+        green_count_nw_kgw = detect_result_nw_kgw["num_green_tokens"]
 
-        # Store per-prompt results.
+        judgement_kgw = (
+            "LLM-generated (watermarked)" if z_kgw > args.detection_z_threshold else "Human-generated (non-watermarked)"
+        )
+        perplexity_wm_kgw = compute_perplexity(model, tokenizer, decoded_wm_kgw, device)
+        perplexity_nw_kgw = compute_perplexity(model, tokenizer, decoded_nw_kgw, device)
+        tokens_generated_kgw = len(tokenizer(decoded_wm_kgw)["input_ids"])
+
+        # --- Cosine-based Method ---
+        redecoded_input_cos, truncation_warning_cos, decoded_nw_cos, decoded_wm_cos, _ = generate(
+            prompt, args_cos, model=model, device=device, tokenizer=tokenizer
+        )
+        wm_processor_cos = WatermarkLogitsProcessor(
+            vocab=list(tokenizer.get_vocab().values()),
+            gamma=args_cos.gamma,
+            delta=args_cos.delta,
+            seeding_scheme=args_cos.seeding_scheme,
+            select_green_tokens=args_cos.select_green_tokens,
+            precomputed_pairing=args_cos.precomputed_pairing,
+            unique_tokens=args_cos.unique_tokens
+        )
+        green_count_w_cos, tokens_scored_w_cos, prop_w_cos = count_green_tokens_paired(
+            tokenizer, wm_processor_cos, decoded_wm_cos
+        )
+        z_cos, p_cos = compute_p_value(green_count_w_cos, tokens_scored_w_cos)
+
+        green_count_nw_cos, tokens_scored_nw_cos, prop_nw_cos = count_green_tokens_paired(
+            tokenizer, wm_processor_cos, decoded_nw_cos
+        )
+        z_nw_cos, p_nw_cos = compute_p_value(green_count_nw_cos, tokens_scored_nw_cos)
+        judgement_cos = (
+            "LLM-generated (watermarked)" if z_cos > args_cos.detection_z_threshold else "Human-generated (non-watermarked)"
+        )
+        perplexity_wm_cos = compute_perplexity(model, tokenizer, decoded_wm_cos, device)
+        perplexity_nw_cos = compute_perplexity(model, tokenizer, decoded_nw_cos, device)
+        tokens_generated_cos = len(tokenizer(decoded_wm_cos)["input_ids"])
+
+        # Store per-prompt results
         result = {
             "prompt": redecoded_input,
-            "decoded_output_with_watermark": decoded_output_with_watermark,
-            "decoded_output_without_watermark": decoded_output_without_watermark,
-            "green_count_w": green_count_w,
-            "tokens_scored_w": tokens_scored_w,
-            "prop_w": prop_w,
-            "z_w": z_w,
-            "p_w": p_w,
-            "judgement_w": judgement_w,
-            "ppl_wm": ppl_wm,
-            "green_count_nw": green_count_nw,
-            "tokens_scored_nw": tokens_scored_nw,
-            "prop_nw": prop_nw,
-            "z_nw": z_nw,
-            "p_nw": p_nw,
-            "judgement_nw": judgement_nw,
-            "ppl_nw": ppl_nw,
-            "decoded_output_with_watermark_kgw": decoded_output_with_watermark_kgw,
-            "green_count_kgw": green_count_kgw,
-            "tokens_scored_kgw": tokens_scored_kgw,
-            "prop_kgw": prop_kgw,
-            "z_kgw": z_kgw,
-            "p_kgw": p_kgw,
-            "judgement_kgw": judgement_kgw,
-            "ppl_wm_kgw": ppl_wm_kgw
+            "default": {
+                "decoded_wm": decoded_wm,
+                "decoded_nw": decoded_nw,
+                "green_count_w": green_count_w,
+                "green_count_nw": green_count_nw,
+                "tokens_scored_w": tokens_scored_w,
+                "tokens_scored_nw": tokens_scored_nw,
+                "prop_w": prop_w,
+                "z_w": z_default,
+                "z_nw": z_nw_default,
+                "p_w": p_default,
+                "judgement": judgement_default,
+                "ppl_wm": perplexity_wm,
+                "ppl_nw": perplexity_nw,
+                "tokens_generated": tokens_generated_default
+            },
+            "kgw": {
+                "decoded_wm": decoded_wm_kgw,
+                "decoded_nw": decoded_nw_kgw,
+                "green_count_w": green_count_w_kgw,
+                "tokens_scored_w": tokens_scored_w_kgw_local,
+                "prop_w": prop_w_kgw,
+                "z_w": z_kgw,
+                "p_w": detect_result_w_kgw.get("p_value", None),
+                "judgement": judgement_kgw,
+                "ppl_wm": perplexity_wm_kgw,
+                "ppl_nw": perplexity_nw_kgw,
+                "tokens_generated": tokens_generated_kgw
+            },
+            "cos": {
+                "decoded_wm": decoded_wm_cos,
+                "decoded_nw": decoded_nw_cos,
+                "green_count_w": green_count_w_cos,
+                "tokens_scored_w": tokens_scored_w_cos,
+                "prop_w": prop_w_cos,
+                "z_w": z_cos,
+                "p_w": p_cos,
+                "judgement": judgement_cos,
+                "ppl_wm": perplexity_wm_cos,
+                "ppl_nw": perplexity_nw_cos,
+                "tokens_generated": tokens_generated_cos
+            }
         }
         results.append(result)
+        # Optional prompt-level printing:
+        print(result)
 
-        # Only consider prompts where both generated outputs have length >= 195 tokens.
-        len_wm = len(tokenizer(decoded_output_with_watermark)["input_ids"])
-        len_nw = len(tokenizer(decoded_output_without_watermark)["input_ids"])
-        len_wm_kgw = len(tokenizer(decoded_output_with_watermark_kgw)["input_ids"])
-        if len_wm >= 195 and len_nw >= 195:
-            watermarked_z.append(z_w)
-            nonwatermarked_z.append(z_nw)
-            true_labels.append(1)  # watermarked output label is 1
-            true_labels.append(0)  # non-watermarked output label is 0
-            watermarked_perplexities.append(ppl_wm)
-            nonwatermarked_perplexities.append(ppl_nw)
+        # Only consider prompts where all three methods produce outputs of length ≥ 195 tokens.
+        if (valid_length(decoded_wm, decoded_nw, tokenizer) and
+            valid_length(decoded_wm_kgw, decoded_nw_kgw, tokenizer) and
+            valid_length(decoded_wm_cos, decoded_nw_cos, tokenizer)):
 
-        if len_wm_kgw >= 195 and len_nw >= 195:
-            watermarked_z_kgw.append(z_kgw)
-            nonwatermarked_z_kgw.append(z_nw_kgw)
-            true_labels_kgw.append(1)  # watermarked output label is 1
-            true_labels_kgw.append(0)  # non-watermarked output label is 0
-            watermarked_perplexities_kgw.append(ppl_wm_kgw)
-            nonwatermarked_perplexities_kgw.append(ppl_nw_kgw)
+            # Accumulate Default method metrics.
+            wm_z_default_acc.append(z_default)
+            nw_z_default_acc.append(z_nw_default)
+            labels_default.extend([1, 0])
+            ppl_wm_default_acc.append(perplexity_wm)
+            ppl_nw_default_acc.append(perplexity_nw)
+            green_counts_w_default_acc.append(green_count_w)
+            tokens_scored_w_default_acc.append(tokens_scored_w)
 
-    # Compute average perplexity over valid prompts.
-    avg_ppl_wm = np.mean(watermarked_perplexities) if watermarked_perplexities else None
-    avg_ppl_wm_kgw = np.mean(watermarked_perplexities_kgw) if watermarked_perplexities_kgw else None
-    avg_ppl_nw = np.mean(nonwatermarked_perplexities) if nonwatermarked_perplexities else None
+            # KGW method accumulators.
+            wm_z_kgw_acc.append(z_kgw)
+            nw_z_kgw_acc.append(z_nw_kgw)
+            labels_kgw.extend([1, 0])
+            ppl_wm_kgw_acc.append(perplexity_wm_kgw)
+            ppl_nw_kgw_acc.append(perplexity_nw_kgw)
+            green_counts_w_kgw_acc.append(green_count_w_kgw)
+            tokens_scored_w_kgw_acc.append(tokens_scored_w_kgw_local)
 
-    # Compute AUC using the combined watermarked and non-watermarked z-scores.
-    all_scores = watermarked_z + nonwatermarked_z
-    all_labels = [1] * len(watermarked_z) + [0] * len(nonwatermarked_z)
-    auc = roc_auc_score(all_labels, all_scores) if len(all_scores) > 0 else None
+            # Cosine-based method accumulators.
+            wm_z_cos_acc.append(z_cos)
+            nw_z_cos_acc.append(z_nw_cos)
+            labels_cos.extend([1, 0])
+            ppl_wm_cos_acc.append(perplexity_wm_cos)
+            ppl_nw_cos_acc.append(perplexity_nw_cos)
+            green_counts_w_cos_acc.append(green_count_w_cos)
+            tokens_scored_w_cos_acc.append(tokens_scored_w_cos)
 
-    # Compute AUC using the combined watermarked and non-watermarked z-scores.
-    all_scores_kgw = watermarked_z_kgw + nonwatermarked_z_kgw
-    all_labels_kgw = [1] * len(watermarked_z_kgw) + [0] * len(nonwatermarked_z_kgw)
-    auc_kgw = roc_auc_score(all_labels_kgw, all_scores_kgw) if len(all_scores_kgw) > 0 else None
+            num_valid = len(ppl_wm_default_acc)
+            curr_avg_ppl_wm_default = np.mean(ppl_wm_default_acc)
+            curr_avg_ppl_nw_default = np.mean(ppl_nw_default_acc)
+            curr_avg_ppl_wm_kgw = np.mean(ppl_wm_kgw_acc)
+            curr_avg_ppl_nw_kgw = np.mean(ppl_nw_kgw_acc)
+            curr_avg_ppl_wm_cos = np.mean(ppl_wm_cos_acc)
+            curr_avg_ppl_nw_cos = np.mean(ppl_nw_cos_acc)
 
-    aggregated = {
-        "avg_ppl_wm": avg_ppl_wm,
-        "avg_ppl_wm_kgw": avg_ppl_wm_kgw,
-        "avg_ppl_nw": avg_ppl_nw,
-        "auc": auc,
-        "auc_kgw": auc_kgw,
-        "num_valid_prompts": len(watermarked_perplexities),  # number of prompts meeting the length condition
-        "num_valid_prompts_kgw": len(watermarked_perplexities_kgw)  # number of prompts meeting the length condition
-    }
+            # -- Use roc_curve() and auc() here instead of roc_auc_score() --
+            try:
+                # For default method:
+                all_scores_default = wm_z_default_acc + nw_z_default_acc
+                fpr_def, tpr_def, _ = roc_curve(labels_default, all_scores_default)
+                curr_auc_default = auc(fpr_def, tpr_def)
+            except Exception:
+                curr_auc_default = float('nan')
+
+            try:
+                # For KGW method:
+                all_scores_kgw = wm_z_kgw_acc + nw_z_kgw_acc
+                fpr_kgw, tpr_kgw, _ = roc_curve(labels_kgw, all_scores_kgw)
+                curr_auc_kgw = auc(fpr_kgw, tpr_kgw)
+            except Exception:
+                curr_auc_kgw = float('nan')
+
+            try:
+                # For Cosine-based method:
+                all_scores_cos = wm_z_cos_acc + nw_z_cos_acc
+                fpr_cos, tpr_cos, _ = roc_curve(labels_cos, all_scores_cos)
+                curr_auc_cos = auc(fpr_cos, tpr_cos)
+            except Exception:
+                curr_auc_cos = float('nan')
+
+            print(f"\nAfter {num_valid} valid prompts:")
+            print(" Default Method:    avg ppl (wm) = {0:.2f}, avg ppl (nw) = {1:.2f}, AUC = {2:.3f}".format(
+                curr_avg_ppl_wm_default, curr_avg_ppl_nw_default, curr_auc_default))
+            print(" KGW Method:        avg ppl (wm) = {0:.2f}, avg ppl (nw) = {1:.2f}, AUC = {2:.3f}".format(
+                curr_avg_ppl_wm_kgw, curr_avg_ppl_nw_kgw, curr_auc_kgw))
+            print(" Cosine-based Method: avg ppl (wm) = {0:.2f}, avg ppl (nw) = {1:.2f}, AUC = {2:.3f}\n".format(
+                curr_avg_ppl_wm_cos, curr_avg_ppl_nw_cos, curr_auc_cos))
+
+    # Final aggregated metrics
+    aggregated = {}
+
+    # Summaries for each method:
+    def finalize_metrics(labels, wm_z_list, nw_z_list, ppl_wm_list, ppl_nw_list, method_name):
+        out_dict = {}
+        if len(ppl_wm_list) > 0:
+            out_dict["avg_ppl_wm"] = np.mean(ppl_wm_list)
+            out_dict["avg_ppl_nw"] = np.mean(ppl_nw_list)
+            out_dict["num_valid"] = len(ppl_wm_list)
+        else:
+            out_dict["avg_ppl_wm"] = None
+            out_dict["avg_ppl_nw"] = None
+            out_dict["num_valid"] = 0
+
+        if wm_z_list and nw_z_list:
+            all_scores = wm_z_list + nw_z_list
+            try:
+                fpr, tpr, _ = roc_curve(labels, all_scores)
+                out_dict["auc"] = auc(fpr, tpr)
+            except Exception:
+                out_dict["auc"] = None
+        else:
+            out_dict["auc"] = None
+
+        aggregated[method_name] = out_dict
+
+    # Default
+    finalize_metrics(labels_default,
+                     wm_z_default_acc, nw_z_default_acc,
+                     ppl_wm_default_acc, ppl_nw_default_acc,
+                     "default")
+
+    # KGW
+    finalize_metrics(labels_kgw,
+                     wm_z_kgw_acc, nw_z_kgw_acc,
+                     ppl_wm_kgw_acc, ppl_nw_kgw_acc,
+                     "kgw")
+
+    # Cosine
+    finalize_metrics(labels_cos,
+                     wm_z_cos_acc, nw_z_cos_acc,
+                     ppl_wm_cos_acc, ppl_nw_cos_acc,
+                     "cos")
 
     return results, aggregated
 
 
-# === Example usage ===
+# --- Example usage ---
 if __name__ == "__main__":
     args = parse_args()
     model, tokenizer, device = load_model(args)
@@ -849,7 +1088,7 @@ if __name__ == "__main__":
     # For example, you may load them from a file or sample from a dataset.
     # Here we assume truncated_texts is already defined.
 
-    # --- Precompute Vocabulary and Matching ---
+    # --- Precompute Vocabulary and Perfect Matching via Dictionary ---
     tokenizer_for_vocab = AutoTokenizer.from_pretrained(args.model_name_or_path)
     vocab_list = get_vocabulary(tokenizer_for_vocab)
     print(f"Vocabulary size: {len(vocab_list)}")
@@ -862,10 +1101,19 @@ if __name__ == "__main__":
     args.precomputed_pairing = mapped_pairing
     args.unique_tokens = unique_indices
 
+    # --- Precompute Vocabulary and Perfect Matching via Cosine Similarity ---
+    args_cos = parse_args()
+    embedding_matrix = model.get_input_embeddings().weight  # shape: (vocab_size, hidden_dim)
+    similarity_matrix_cos = construct_similarity_matrix_cos(vocab_list, paired_indices, embedding_matrix)
+    matching_cos = find_perfect_matching_greedy_random(similarity_matrix_cos)
+    mapped_pairing_cos = [(paired_indices[i], paired_indices[j]) for (i, j) in matching_cos]
+    args_cos.precomputed_pairing = mapped_pairing_cos
+    args_cos.unique_tokens = unique_indices
+
     # --- Load the "realnewslike" subset of C4 (English) and Shuffle the dataset with a fixed seed for reproducibility ---
     c4_realnewslike = load_dataset("c4", "realnewslike", split="train", streaming=False, trust_remote_code=True)
-    shuffled_dataset = c4_realnewslike.shuffle(seed=42)
-    sampled_examples = shuffled_dataset.select(range(200))
+    shuffled_dataset = c4_realnewslike.shuffle(seed=44)
+    sampled_examples = shuffled_dataset.select(range(300))
     sampled_texts = [example["text"] for example in sampled_examples]
     print(f"Sampled {len(sampled_texts)} news-like texts from C4.")
     max_words = 150
@@ -875,40 +1123,54 @@ if __name__ == "__main__":
         truncated_text = " ".join(words[:max_words])
         truncated_texts.append(truncated_text)
 
-    # --- Evaluate Watermarking on all 500 prompts ---
-    results, aggregated = evaluate_watermarking(truncated_texts, model, tokenizer, args)
+    results, aggregated = evaluate_watermarking(truncated_texts, model, tokenizer, args, args_cos)
 
-    # --- Print per-prompt results for the first 5 examples ---
+    # Print per-prompt results for the first 5 prompts.
     for r in results[:5]:
         print("=== Prompt ===")
         print(r["prompt"])
-        print("--- Watermarked Text ---")
-        print(r["decoded_output_with_watermark"])
-        print("Detection (Watermarked):")
-        print(f"  Green tokens (paired only): {r['green_count_w']} / {r['tokens_scored_w']} ({r['prop_w']:.2%})")
-        print(f"  z–score: {r['z_w']:.2f}, p–value: {r['p_w']:.4f}")
-        print(f"  Judgement: {r['judgement_w']}")
-        print(f"  Perplexity: {r['ppl_wm']:.2f}")
-        print("--- Watermarked Text KGW ---")
-        print(r["decoded_output_with_watermark_kgw"])
-        print("Detection (Watermarked KGW):")
-        print(f"  Green tokens (paired only): {r['green_count_kgw']} / {r['tokens_scored_kgw']} ({r['prop_kgw']:.2%})")
-        print(f"  z–score: {r['z_kgw']:.2f}, p–value: {r['p_kgw']:.4f}")
-        print(f"  Judgement: {r['judgement_kgw']}")
-        print(f"  Perplexity: {r['ppl_wm_kgw']:.2f}")
-        print("--- Non-watermarked Text ---")
-        print(r["decoded_output_without_watermark"])
-        print("Detection (Non-watermarked):")
-        print(f"  Green tokens (paired only): {r['green_count_nw']} / {r['tokens_scored_nw']} ({r['prop_nw']:.2%})")
-        print(f"  z–score: {r['z_nw']:.2f}, p–value: {r['p_nw']:.4f}")
-        print(f"  Judgement: {r['judgement_nw']}")
-        print(f"  Perplexity: {r['ppl_nw']:.2f}")
+        print("--- Default Method ---")
+        print("Watermarked Text:")
+        print(r["default"]["decoded_wm"])
+        print("Detection (Default):")
+        print(f"  Green tokens (paired): {r['default']['green_count_w']} / {r['default']['tokens_scored_w']} ({r['default']['prop_w']:.2%})")
+        print(f"  z–score: {r['default']['z_w']:.2f}, p–value: {r['default']['p_w']:.4f}")
+        print(f"  Judgement: {r['default']['judgement']}")
+        print(f"  Perplexity: {r['default']['ppl_wm']:.2f}")
+        print("--- KGW Method ---")
+        print("Watermarked Text:")
+        print(r["kgw"]["decoded_wm"])
+        print("Detection (KGW):")
+        print(f"  Green tokens (paired): {r['kgw']['green_count_w']} / {r['kgw']['tokens_scored_w']} ({r['kgw']['prop_w']:.2%})")
+        print(f"  z–score: {r['kgw']['z_w']:.2f}, p–value: {r['kgw']['p_w']:.4f}")
+        print(f"  Judgement: {r['kgw']['judgement']}")
+        print(f"  Perplexity: {r['kgw']['ppl_wm']:.2f}")
+        print("--- Cosine-based Method ---")
+        print("Watermarked Text:")
+        print(r["cos"]["decoded_wm"])
+        print("Detection (Cos):")
+        print(f"  Green tokens (paired): {r['cos']['green_count_w']} / {r['cos']['tokens_scored_w']} ({r['cos']['prop_w']:.2%})")
+        print(f"  z–score: {r['cos']['z_w']:.2f}, p–value: {r['cos']['p_w']:.4f}")
+        print(f"  Judgement: {r['cos']['judgement']}")
+        print(f"  Perplexity: {r['cos']['ppl_wm']:.2f}")
         print("\n")
 
+    # Print aggregated metrics.
     print("=== Aggregated Metrics ===")
-    print(f"Average Perplexity (Watermarked): {aggregated['avg_ppl_wm']:.2f}")
-    print(f"Average Perplexity (Watermarked KGW): {aggregated['avg_ppl_wm_kgw']:.2f}")
-    print(f"Average Perplexity (Non-watermarked): {aggregated['avg_ppl_nw']:.2f}")
-    print(f"AUC for Watermark Detection: {aggregated['auc']:.3f}")
-    print(f"AUC for Watermark Detection (KGW): {aggregated['auc_kgw']:.3f}")
-    print(f"Number of valid prompts (>=195 tokens in both outputs): {aggregated['num_valid_prompts']}")
+    print("Default Method:")
+    print("  Average Perplexity (Watermarked):", aggregated["default"]["avg_ppl_wm"])
+    print("  Average Perplexity (Non-watermarked):", aggregated["default"]["avg_ppl_nw"])
+    print("  AUC:", aggregated["default"]["auc"])
+    print("  Valid prompts:", aggregated["default"]["num_valid"])
+
+    print("\nKGW Method:")
+    print("  Average Perplexity (Watermarked):", aggregated["kgw"]["avg_ppl_wm"])
+    print("  Average Perplexity (Non-watermarked):", aggregated["kgw"]["avg_ppl_nw"])
+    print("  AUC:", aggregated["kgw"]["auc"])
+    print("  Valid prompts:", aggregated["kgw"]["num_valid"])
+
+    print("\nCosine-based Method:")
+    print("  Average Perplexity (Watermarked):", aggregated["cos"]["avg_ppl_wm"])
+    print("  Average Perplexity (Non-watermarked):", aggregated["cos"]["avg_ppl_nw"])
+    print("  AUC:", aggregated["cos"]["auc"])
+    print("  Valid prompts:", aggregated["cos"]["num_valid"])
