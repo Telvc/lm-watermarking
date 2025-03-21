@@ -329,6 +329,7 @@ def detect_kgw(input_text, args, device=None, tokenizer=None):
         # output = str_format_scores(score_dict, watermark_detector.z_threshold)
         output = list_format_scores(score_dict, watermark_detector.z_threshold)
     else:
+        score_dict = None
         # output = (f"Error: string not long enough to compute watermark presence.")
         output = [["Error", "string too short to compute metrics"]]
         output += [["", ""] for _ in range(6)]
