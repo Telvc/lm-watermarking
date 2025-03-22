@@ -192,7 +192,8 @@ class WatermarkDetector_kgw(WatermarkBase_kgw):
         else:
             num_tokens_scored = len(input_ids) - self.min_prefix_len
             if num_tokens_scored < 1:
-                raise ValueError("Not enough tokens to score.")
+                score_dict = None
+                return score_dict #raise ValueError("Not enough tokens to score.")
             green_token_count = 0
             green_token_mask = []
             for idx in range(self.min_prefix_len, len(input_ids)):
