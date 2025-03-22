@@ -859,7 +859,7 @@ def evaluate_watermarking(truncated_texts, model, tokenizer, args, args_cos=None
             prompt, args, model=model, device=device, tokenizer=tokenizer
         )
         detect_result_w_kgw = detect_kgw(decoded_wm_kgw, args, device=device, tokenizer=tokenizer)[1]
-        if detect_result_w_kgw.score_dict == None:
+        if len(decoded_wm_kgw) < 195:
             continue
         z_kgw = detect_result_w_kgw["z_score"]
         green_count_w_kgw = detect_result_w_kgw["num_green_tokens"]
@@ -867,7 +867,8 @@ def evaluate_watermarking(truncated_texts, model, tokenizer, args, args_cos=None
         prop_w_kgw = detect_result_w_kgw["green_fraction"]
 
         detect_result_nw_kgw = detect_kgw(decoded_nw_kgw, args, device=device, tokenizer=tokenizer)[1]
-        if detect_result_nw_kgw.score_dict == None:
+        print(decoded_nw_kgw)
+        if len(decoded_nw_kgw) < 195:
             continue
         z_nw_kgw = detect_result_nw_kgw["z_score"]
         green_count_nw_kgw = detect_result_nw_kgw["num_green_tokens"]
@@ -1112,7 +1113,7 @@ if __name__ == "__main__":
 
     # --- Load the "realnewslike" subset of C4 (English) and Shuffle the dataset with a fixed seed for reproducibility ---
     c4_realnewslike = load_dataset("c4", "realnewslike", split="train", streaming=False, trust_remote_code=True)
-    shuffled_dataset = c4_realnewslike.shuffle(seed=44)
+    shuffled_dataset = c4_realnewslike.shuffle(seed=45)
     sampled_examples = shuffled_dataset.select(range(300))
     sampled_texts = [example["text"] for example in sampled_examples]
     print(f"Sampled {len(sampled_texts)} news-like texts from C4.")
